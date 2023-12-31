@@ -1,0 +1,2217 @@
+# -----------------------------------------------------------------------------------
+# Swin2SR: Swin2SR: SwinV2 Transformer for Compressed Image Super-Resolution and Restoration, https://arxiv.org/abs/2209.11345
+# Written by Conde and Choi et al.
+# -----------------------------------------------------------------------------------
+
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+
+from .layers_quant import (DropPath, HybridEmbed, Mlp, PatchEmbed, to_2tuple,
+                           trunc_normal_)
+from .ptq import QAct, QConv2d, QIntLayerNorm, QIntSoftmax, QLinear
+
+
+class Mlp(nn.Module): # => changed
+    def __init__(self, 
+                 in_features, 
+                 hidden_features=None, 
+                 out_features=None, 
+                 act_layer=nn.GELU, 
+                 drop=0.0,
+                 quant=False,
+                 calibrate=False,
+                 cfg=None):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        #self.fc1 = nn.Linear(in_features, hidden_features)
+        self.fc1 = QLinear(in_features,
+                           hidden_features,
+                           quant=quant,
+                           calibrate=calibrate,
+                           bit_type=cfg.BIT_TYPE_W,
+                           calibration_mode=cfg.CALIBRATION_MODE_W,
+                           observer_str=cfg.OBSERVER_W,
+                           quantizer_str=cfg.QUANTIZER_W)
+        self.act = act_layer()
+        self.qact1 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A,
+                          observer_str=cfg.OBSERVER_A,
+                          quantizer_str=cfg.QUANTIZER_A)
+        #self.fc2 = nn.Linear(hidden_features, out_features)
+        self.fc2 = QLinear(hidden_features,
+                           out_features,
+                           quant=quant,
+                           calibrate=calibrate,
+                           bit_type=cfg.BIT_TYPE_W,
+                           calibration_mode=cfg.CALIBRATION_MODE_W,
+                           observer_str=cfg.OBSERVER_W,
+                           quantizer_str=cfg.QUANTIZER_W)
+        self.qact2 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A,
+                          observer_str=cfg.OBSERVER_A,
+                          quantizer_str=cfg.QUANTIZER_A)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.qact1(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.qact2(x)
+        x = self.drop(x)
+        return x
+
+
+def window_partition(x, window_size): # => no change
+    """
+    Args:
+        x: (B, H, W, C)
+        window_size (int): window size
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+
+def window_reverse(windows, window_size, H, W): # => no changes
+    """
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size (int): Window size
+        H (int): Height of image
+        W (int): Width of image
+    Returns:
+        x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+class WindowAttention(nn.Module):
+    r""" Window based multi-head self attention (W-MSA) module with relative position bias.
+    It supports both of shifted and non-shifted window.
+    Args:
+        dim (int): Number of input channels.
+        window_size (tuple[int]): The height and width of the window.
+        num_heads (int): Number of attention heads.
+        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
+        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
+        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
+        pretrained_window_size (tuple[int]): The height and width of the window in pre-training.
+    """
+
+    def __init__(self, 
+                 dim, 
+                 window_size, 
+                 num_heads, 
+                 qkv_bias=True, 
+                 attn_drop=0., 
+                 proj_drop=0.,
+                 pretrained_window_size=[0, 0],
+                 quant=False,
+                 calibrate=False,
+                 cfg=None):
+
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size  # Wh, Ww
+        self.pretrained_window_size = pretrained_window_size
+        self.num_heads = num_heads
+
+        self.logit_scale = nn.Parameter(torch.log(10 * torch.ones((num_heads, 1, 1))), requires_grad=True)
+
+        # mlp to generate continuous relative position bias
+        self.cpb_mlp = nn.Sequential(nn.Linear(2, 512, bias=True),
+                                     nn.ReLU(inplace=True),
+                                     nn.Linear(512, num_heads, bias=False))
+
+        # get relative_coords_table
+        relative_coords_h = torch.arange(-(self.window_size[0] - 1), self.window_size[0], dtype=torch.float32)
+        relative_coords_w = torch.arange(-(self.window_size[1] - 1), self.window_size[1], dtype=torch.float32)
+        relative_coords_table = torch.stack(
+            torch.meshgrid([relative_coords_h,
+                            relative_coords_w])).permute(1, 2, 0).contiguous().unsqueeze(0)  # 1, 2*Wh-1, 2*Ww-1, 2
+        if pretrained_window_size[0] > 0:
+            relative_coords_table[:, :, :, 0] /= (pretrained_window_size[0] - 1)
+            relative_coords_table[:, :, :, 1] /= (pretrained_window_size[1] - 1)
+        else:
+            relative_coords_table[:, :, :, 0] /= (self.window_size[0] - 1)
+            relative_coords_table[:, :, :, 1] /= (self.window_size[1] - 1)
+        relative_coords_table *= 8  # normalize to -8, 8
+        relative_coords_table = torch.sign(relative_coords_table) * torch.log2(
+            torch.abs(relative_coords_table) + 1.0) / np.log2(8)
+
+        self.register_buffer("relative_coords_table", relative_coords_table)
+
+        # get pair-wise relative position index for each token inside the window
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        #self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.qkv = QLinear(dim,
+                           dim * 3,
+                           bias=False,
+                           quant=quant,
+                           calibrate=calibrate,
+                           bit_type=cfg.BIT_TYPE_W,
+                           calibration_mode=cfg.CALIBRATION_MODE_W,
+                           observer_str=cfg.OBSERVER_W,
+                           quantizer_str=cfg.QUANTIZER_W)
+        if qkv_bias:
+            self.q_bias = nn.Parameter(torch.zeros(dim))
+            self.v_bias = nn.Parameter(torch.zeros(dim))
+        else:
+            self.q_bias = None
+            self.v_bias = None
+
+        self.qact1 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A,
+                          observer_str=cfg.OBSERVER_A,
+                          quantizer_str=cfg.QUANTIZER_A)
+        self.qact_attn1 = QAct(quant=quant,
+                               calibrate=calibrate,
+                               bit_type=cfg.BIT_TYPE_A,
+                               calibration_mode=cfg.CALIBRATION_MODE_A,
+                               observer_str=cfg.OBSERVER_A,
+                               quantizer_str=cfg.QUANTIZER_A)
+        self.qact_table = QAct(quant=quant,
+                               calibrate=calibrate,
+                               bit_type=cfg.BIT_TYPE_A,
+                               calibration_mode=cfg.CALIBRATION_MODE_A,
+                               observer_str=cfg.OBSERVER_A,
+                               quantizer_str=cfg.QUANTIZER_A)
+        self.qact2 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A,
+                          observer_str=cfg.OBSERVER_A,
+                          quantizer_str=cfg.QUANTIZER_A)
+        
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.log_int_softmax = QIntSoftmax(
+            log_i_softmax=cfg.INT_SOFTMAX,
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_S,
+            calibration_mode=cfg.CALIBRATION_MODE_S,
+            observer_str=cfg.OBSERVER_S,
+            quantizer_str=cfg.QUANTIZER_S)
+        self.qact3 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A,
+                          observer_str=cfg.OBSERVER_A,
+                          quantizer_str=cfg.QUANTIZER_A)
+        self.qact4 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A,
+                          observer_str=cfg.OBSERVER_A,
+                          quantizer_str=cfg.QUANTIZER_A)
+        #self.proj = nn.Linear(dim, dim)
+        self.proj = QLinear(dim,
+                            dim,
+                            quant=quant,
+                            calibrate=calibrate,
+                            bit_type=cfg.BIT_TYPE_W,
+                            calibration_mode=cfg.CALIBRATION_MODE_W,
+                            observer_str=cfg.OBSERVER_W,
+                            quantizer_str=cfg.QUANTIZER_W)
+        
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        B_, N, C = x.shape
+        qkv_bias = None
+        if self.q_bias is not None:
+            qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias, requires_grad=False), self.v_bias))
+        qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
+        
+        qkv = self.qact1(qkv)
+
+        qkv = qkv.reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+
+        # cosine attention
+        attn = (F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1))
+        logit_scale = torch.clamp(self.logit_scale, max=torch.log(torch.tensor(1. / 0.01)).to(self.logit_scale.device)).exp()
+        attn = attn * logit_scale
+
+        attn = self.qact_attn1(attn)
+
+        # relative_position_bias_table = self.cpb_mlp(self.relative_coords_table).view(-1, self.num_heads)
+        relative_position_bias_table_q = self.qact_table(self.cpb_mlp(self.relative_coords_table).view(-1, self.num_heads))
+        # relative_position_bias = relative_position_bias_table[self.relative_position_index.view(-1)].view(
+        #     self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias_table_q[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], 
+            self.window_size[0] * self.window_size[1], 
+            -1)  # Wh*Ww,Wh*Ww,nH
+        
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        relative_position_bias = 16 * torch.sigmoid(relative_position_bias)
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        attn = self.qact2(attn)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            # attn = self.softmax(attn)
+            attn = self.log_int_softmax(attn, self.qact2.quantizer.scale)
+        else:
+            # attn = self.softmax(attn)
+            attn = self.log_int_softmax(attn, self.qact2.quantizer.scale)
+
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        
+        x = self.qact3(x)
+
+        x = self.proj(x)
+
+        x = self.qact4(x)
+
+        x = self.proj_drop(x)
+        return x
+
+    def extra_repr(self) -> str: # => no changes
+        return f'dim={self.dim}, window_size={self.window_size}, ' \
+               f'pretrained_window_size={self.pretrained_window_size}, num_heads={self.num_heads}'
+
+    def flops(self, N): # => no changes
+        # calculate flops for 1 window with token length of N
+        flops = 0
+        # qkv = self.qkv(x)
+        flops += N * self.dim * 3 * self.dim
+        # attn = (q @ k.transpose(-2, -1))
+        flops += self.num_heads * N * (self.dim // self.num_heads) * N
+        #  x = (attn @ v)
+        flops += self.num_heads * N * N * (self.dim // self.num_heads)
+        # x = self.proj(x)
+        flops += N * self.dim * self.dim
+        return flops
+
+class SwinTransformerBlock(nn.Module):
+    r""" Swin Transformer Block.
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resulotion.
+        num_heads (int): Number of attention heads.
+        window_size (int): Window size.
+        shift_size (int): Shift size for SW-MSA.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float, optional): Stochastic depth rate. Default: 0.0
+        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+        pretrained_window_size (int): Window size in pre-training.
+    """
+
+    def __init__(self, 
+                 dim, 
+                 input_resolution, 
+                 num_heads, 
+                 window_size=7, 
+                 shift_size=0,
+                 mlp_ratio=4., 
+                 qkv_bias=True, 
+                 drop=0., 
+                 attn_drop=0., 
+                 drop_path=0.,
+                 act_layer=nn.GELU, 
+                 norm_layer=nn.LayerNorm, 
+                 pretrained_window_size=0,
+                 quant=False,
+                 calibrate=False,
+                 cfg=None):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        if min(self.input_resolution) <= self.window_size:
+            # if window size is larger than input resolution, we don't partition windows
+            self.shift_size = 0
+            self.window_size = min(self.input_resolution)
+        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
+
+        self.norm1 = norm_layer(dim)
+
+        self.qact1 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A,
+                          observer_str=cfg.OBSERVER_A,
+                          quantizer_str=cfg.QUANTIZER_A)
+        # print(f"In SwinTransformerBlock: BIT_TYPE_W={cfg.BIT_TYPE_A.name}, quantizer_str={cfg.QUANTIZER_A}")
+        self.attn = WindowAttention(
+            dim, 
+            window_size=to_2tuple(self.window_size), 
+            num_heads=num_heads,
+            qkv_bias=qkv_bias, 
+            attn_drop=attn_drop, 
+            proj_drop=drop,
+            pretrained_window_size=to_2tuple(pretrained_window_size),
+            quant=quant,
+            calibrate=calibrate,
+            cfg=cfg)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        self.qact2 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A_LN,
+                          observer_str=cfg.OBSERVER_A_LN,
+                          quantizer_str=cfg.QUANTIZER_A_LN)
+        
+
+        self.norm2 = norm_layer(dim)
+
+        self.qact3 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A,
+                          observer_str=cfg.OBSERVER_A,
+                          quantizer_str=cfg.QUANTIZER_A)
+
+        mlp_hidden_dim = int(dim * mlp_ratio)
+
+        self.mlp = Mlp(in_features=dim, 
+                       hidden_features=mlp_hidden_dim, 
+                       act_layer=act_layer, 
+                       drop=drop,
+                       quant=quant,
+                       calibrate=calibrate,
+                       cfg=cfg)
+        
+    
+        self.qact4 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A_LN,
+                          observer_str=cfg.OBSERVER_A_LN,
+                          quantizer_str=cfg.QUANTIZER_A_LN)
+
+        if self.shift_size > 0:
+            attn_mask = self.calculate_mask(self.input_resolution)
+        else:
+            attn_mask = None
+
+        self.register_buffer("attn_mask", attn_mask)
+        
+    def calculate_mask(self, x_size):
+        # calculate attention mask for SW-MSA
+        H, W = x_size
+        img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
+        h_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        w_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+
+        mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
+        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+
+        return attn_mask        
+
+    def forward(self, x, x_size, last_quantizer=None):
+        H, W = x_size
+        B, L, C = x.shape
+        #assert L == H * W, "input feature has wrong size"
+        # last_quantizer= None
+        shortcut = x
+        x = x.view(B, H, W, C)
+
+        # cyclic shift
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, 
+                                   shifts=(-self.shift_size, -self.shift_size), 
+                                   dims=(1, 2))
+        else:
+            shifted_x = x
+
+        # partition windows
+        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+
+        # W-MSA/SW-MSA (to be compatible for testing on images whose shapes are the multiple of window size
+        if self.input_resolution == x_size:
+            attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+        else:
+            attn_windows = self.attn(x_windows, mask=self.calculate_mask(x_size).to(x.device))
+            
+        # merge windows
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+
+        # reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, 
+                           shifts=(self.shift_size, self.shift_size), 
+                           dims=(1, 2))
+        else:
+            x = shifted_x
+        x = x.view(B, H * W, C)
+
+        x = self.norm1(x, last_quantizer, self.qact1.quantizer)
+        x = self.qact1(x)
+
+        # x = shortcut + self.drop_path(self.norm1(x))
+        x = shortcut + self.drop_path(x)
+
+        x = self.qact2(x)
+
+        # FFN
+        # x = x + self.drop_path(self.norm2(self.mlp(x)))
+        x = x + self.drop_path(self.qact3(self.norm2(self.mlp(x), self.qact2.quantizer,
+                               self.qact3.quantizer)))
+
+        x = self.qact4(x)
+        return x
+
+    def extra_repr(self) -> str: # => no changes
+        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
+               f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
+
+    def flops(self): # => no changes
+        flops = 0
+        H, W = self.input_resolution
+        # norm1
+        flops += self.dim * H * W
+        # W-MSA/SW-MSA
+        nW = H * W / self.window_size / self.window_size
+        flops += nW * self.attn.flops(self.window_size * self.window_size)
+        # mlp
+        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
+        # norm2
+        flops += self.dim * H * W
+        return flops
+
+class PatchMerging(nn.Module):
+    r""" Patch Merging Layer.
+    Args:
+        input_resolution (tuple[int]): Resolution of input feature.
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, 
+                 input_resolution, 
+                 dim, 
+                 norm_layer=nn.LayerNorm,
+                 quant=False,
+                 calibrate=False,
+                 cfg=None
+                 ):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.dim = dim
+        
+        self.norm = norm_layer(2 * dim)
+        self.qact1 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A,
+                          observer_str=cfg.OBSERVER_A,
+                          quantizer_str=cfg.QUANTIZER_A)
+        
+        # self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.reduction = QLinear(4 * dim,
+                                 2 * dim,
+                                 bias=False,
+                                 quant=quant,
+                                 calibrate=calibrate,
+                                 bit_type=cfg.BIT_TYPE_W,
+                                 calibration_mode=cfg.CALIBRATION_MODE_W,
+                                 observer_str=cfg.OBSERVER_W,
+                                 quantizer_str=cfg.QUANTIZER_W)
+        self.qact2 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A_LN,
+                          observer_str=cfg.OBSERVER_A_LN,
+                          quantizer_str=cfg.QUANTIZER_A_LN)
+
+       
+
+    def forward(self, x, last_quantizer=None):
+        """
+        x: B, H*W, C
+        """
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
+
+        x = x.view(B, H, W, C)
+
+        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
+        x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
+        x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
+        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
+        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
+        x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
+
+        x = self.reduction(x)
+        x = self.qact2(x)
+        # x = self.norm(x)
+        x = self.norm(x, last_quantizer, self.qact1.quantizer, 4)
+        x = self.qact1(x)
+
+        return x
+
+    def extra_repr(self) -> str: # => no changes
+        return f"input_resolution={self.input_resolution}, dim={self.dim}"
+
+    def flops(self): # => no chnages
+        H, W = self.input_resolution
+        flops = (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
+        flops += H * W * self.dim // 2
+        return flops    
+
+class BasicLayer(nn.Module):
+    """ A basic Swin Transformer layer for one stage.
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resolution.
+        depth (int): Number of blocks.
+        num_heads (int): Number of attention heads.
+        window_size (int): Local window size.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
+        pretrained_window_size (int): Local window size in pre-training.
+    """
+
+    def __init__(self, 
+                 dim, 
+                 input_resolution, 
+                 depth, 
+                 num_heads, 
+                 window_size,
+                 mlp_ratio=4., 
+                 qkv_bias=True, 
+                 drop=0., 
+                 attn_drop=0.,
+                 drop_path=0., 
+                 norm_layer=nn.LayerNorm, 
+                 downsample=None, 
+                 use_checkpoint=False,
+                 pretrained_window_size=0,
+                 quant=False,
+                 calibrate=False,
+                 cfg=None):
+
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.depth = depth
+        self.use_checkpoint = use_checkpoint
+
+        # build blocks
+        self.blocks = nn.ModuleList([
+            SwinTransformerBlock(dim=dim, 
+                                 input_resolution=input_resolution,
+                                 num_heads=num_heads, 
+                                 window_size=window_size,
+                                 shift_size=0 if (i % 2 == 0) else window_size // 2,
+                                 mlp_ratio=mlp_ratio,
+                                 qkv_bias=qkv_bias,
+                                 drop=drop, 
+                                 attn_drop=attn_drop,
+                                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                                 norm_layer=norm_layer,
+                                 pretrained_window_size=pretrained_window_size,
+                                 quant=quant,
+                                 calibrate=calibrate,
+                                 cfg=cfg)
+            for i in range(depth)])
+
+        # patch merging layer
+        if downsample is not None:
+            self.downsample = downsample(input_resolution, 
+                                         dim=dim, 
+                                         norm_layer=norm_layer,
+                                         quant=quant,
+                                         calibrate=calibrate,
+                                         cfg=cfg)
+        else:
+            self.downsample = None
+
+    def forward(self, x, x_size, last_quantizer=None):
+        for i, blk in enumerate(self.blocks):
+            if not torch.jit.is_scripting() and self.use_checkpoint:
+                x = checkpoint.checkpoint(blk, x, x_size)
+            else:
+                # x = blk(x, x_size)
+                if i == 0:
+                    x = blk(x, x_size, last_quantizer)
+                else:
+                    x = blk(x, x_size, self.blocks[i - 1].qact4.quantizer)
+        if self.downsample is not None:
+            # x = self.downsample(x)
+            x = self.downsample(x, self.blocks[-1].qact4.quantizer)
+        return x
+
+    def extra_repr(self) -> str: # => no changes
+        return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
+
+    def flops(self): # => no changes
+        flops = 0
+        for blk in self.blocks:
+            flops += blk.flops()
+        if self.downsample is not None:
+            flops += self.downsample.flops()
+        return flops
+
+    def _init_respostnorm(self): # => no changes
+        for blk in self.blocks:
+            nn.init.constant_(blk.norm1.bias, 0)
+            nn.init.constant_(blk.norm1.weight, 0)
+            nn.init.constant_(blk.norm2.bias, 0)
+            nn.init.constant_(blk.norm2.weight, 0)
+            
+class PatchEmbed(nn.Module):
+    r""" Image to Patch Embedding
+    Args:
+        img_size (int): Image size.  Default: 224.
+        patch_size (int): Patch token size. Default: 4.
+        in_chans (int): Number of input image channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
+
+    def __init__(self, 
+                 img_size=224, 
+                 patch_size=4, 
+                 in_chans=3, 
+                 embed_dim=96, 
+                 norm_layer=None,
+                 quant=False, 
+                 calibrate=False, 
+                 cfg=None
+                 ):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.patches_resolution = patches_resolution
+        self.num_patches = patches_resolution[0] * patches_resolution[1]
+
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+
+        # self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.proj = QConv2d(in_chans, # => for FQ-ViT
+                            embed_dim, 
+                            kernel_size=patch_size,
+                            stride=patch_size,
+                            quant=quant,
+                            calibrate=calibrate,
+                            bit_type=cfg.BIT_TYPE_W,
+                            calibration_mode=cfg.CALIBRATION_MODE_W,
+                            observer_str=cfg.OBSERVER_W,
+                            quantizer_str=cfg.QUANTIZER_W)
+        
+        if norm_layer:
+            # print(f"I am here 1")
+            self.qact_before_norm = QAct( # => for FQ-ViT
+                quant=quant,
+                calibrate=calibrate,
+                bit_type=cfg.BIT_TYPE_A,
+                calibration_mode=cfg.CALIBRATION_MODE_A,
+                observer_str=cfg.OBSERVER_A,
+                quantizer_str=cfg.QUANTIZER_A)
+            self.norm = norm_layer(embed_dim) # => for FQ-ViT
+            self.qact = QAct(quant=quant, # => for FQ-ViT
+                             calibrate=calibrate,
+                             bit_type=cfg.BIT_TYPE_A,
+                             calibration_mode=cfg.CALIBRATION_MODE_A,
+                             observer_str=cfg.OBSERVER_A,
+                             quantizer_str=cfg.QUANTIZER_A)
+        else:
+            # print(f"I am here 2")
+            self.qact_before_norm = nn.Identity() # => for FQ-ViT
+            self.norm = nn.Identity() # => for FQ-ViT
+            self.qact = QAct(quant=quant, # => for FQ-ViT
+                             calibrate=calibrate,
+                             bit_type=cfg.BIT_TYPE_A,
+                             calibration_mode=cfg.CALIBRATION_MODE_A,
+                             observer_str=cfg.OBSERVER_A,
+                             quantizer_str=cfg.QUANTIZER_A)
+
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        # FIXME look at relaxing size constraints
+        # assert H == self.img_size[0] and W == self.img_size[1],
+        #     f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
+        
+        x = self.qact_before_norm(x) # => for FQ-ViT
+
+        if isinstance(self.norm, nn.Identity):
+            x = self.norm(x)
+        else:
+            x = self.norm(x, self.qact_before_norm.quantizer,
+                          self.qact.quantizer) 
+        x = self.qact(x) # => for FQ-ViT
+
+        # if self.norm is not None:
+        #     x = self.norm(x)
+        return x
+
+    def flops(self): # => no changes
+        Ho, Wo = self.patches_resolution
+        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
+        if self.norm is not None:
+            flops += Ho * Wo * self.embed_dim
+        return flops           
+
+class RSTB(nn.Module): # Pay attention to this block
+    """Residual Swin Transformer Block (RSTB).
+
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resolution.
+        depth (int): Number of blocks.
+        num_heads (int): Number of attention heads.
+        window_size (int): Local window size.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
+        img_size: Input image size.
+        patch_size: Patch size.
+        resi_connection: The convolutional block before residual connection.
+    """
+
+    def __init__(self, 
+                 dim, 
+                 input_resolution, 
+                 depth, 
+                 num_heads, 
+                 window_size,
+                 mlp_ratio=4., 
+                 qkv_bias=True, 
+                 drop=0., 
+                 attn_drop=0.,
+                 drop_path=0., 
+                 norm_layer=nn.LayerNorm, 
+                 downsample=None, 
+                 use_checkpoint=False,
+                 img_size=224, 
+                 patch_size=4, 
+                 resi_connection='1conv',
+                 quant=False,
+                 calibrate=False,
+                 cfg=None):
+        super(RSTB, self).__init__()
+
+        self.dim = dim
+        self.input_resolution = input_resolution
+
+        self.residual_group = BasicLayer(dim=dim,
+                                         input_resolution=input_resolution,
+                                         depth=depth,
+                                         num_heads=num_heads,
+                                         window_size=window_size,
+                                         mlp_ratio=mlp_ratio,
+                                         qkv_bias=qkv_bias, 
+                                         drop=drop, attn_drop=attn_drop,
+                                         drop_path=drop_path,
+                                         norm_layer=norm_layer,
+                                         downsample=downsample,
+                                         use_checkpoint=use_checkpoint,
+                                         quant=quant, # => for FQ-ViT
+                                         calibrate=calibrate, # => for FQ-ViT
+                                         cfg=cfg)
+
+        if resi_connection == '1conv':
+            # self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
+
+            self.conv = QConv2d(dim, # => for FQ-ViT
+                            dim, 
+                            kernel_size=3,
+                            stride=1,
+                            padding=1,
+                            quant=quant,
+                            calibrate=calibrate,
+                            bit_type=cfg.BIT_TYPE_W,
+                            calibration_mode=cfg.CALIBRATION_MODE_W,
+                            observer_str=cfg.OBSERVER_W,
+                            quantizer_str=cfg.QUANTIZER_W)
+            
+        elif resi_connection == '3conv':
+            # to save parameters and memory
+            self.conv1 = QConv2d(dim, # => for FQ-ViT
+                            dim // 4, 
+                            kernel_size=3,
+                            stride=1,
+                            padding=1,
+                            quant=quant,
+                            calibrate=calibrate,
+                            bit_type=cfg.BIT_TYPE_W,
+                            calibration_mode=cfg.CALIBRATION_MODE_W,
+                            observer_str=cfg.OBSERVER_W,
+                            quantizer_str=cfg.QUANTIZER_W)
+
+            self.leakyRelu_1 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+            
+            self.conv2 = QConv2d(dim // 4, # => for FQ-ViT
+                            dim // 4, 
+                            kernel_size=1,
+                            stride=1,
+                            padding=0,
+                            quant=quant,
+                            calibrate=calibrate,
+                            bit_type=cfg.BIT_TYPE_W,
+                            calibration_mode=cfg.CALIBRATION_MODE_W,
+                            observer_str=cfg.OBSERVER_W,
+                            quantizer_str=cfg.QUANTIZER_W)
+            
+            self.leakyRelu_2 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+            
+            self.conv3 = QConv2d(dim // 4, # => for FQ-ViT
+                            dim, 
+                            kernel_size=3,
+                            stride=1,
+                            padding=1,
+                            quant=quant,
+                            calibrate=calibrate,
+                            bit_type=cfg.BIT_TYPE_W,
+                            calibration_mode=cfg.CALIBRATION_MODE_W,
+                            observer_str=cfg.OBSERVER_W,
+                            quantizer_str=cfg.QUANTIZER_W)
+            
+            self.conv = nn.Sequential(self.conv1,
+                                      self.leakyRelu_1,
+                                      self.conv2,
+                                      self.leakyRelu_2,
+                                      self.conv3)
+            
+            # self.conv = nn.Sequential(nn.Conv2d(dim, dim // 4, 3, 1, 1), # => self.conv1
+            #                           nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            #                           nn.Conv2d(dim // 4, dim // 4, 1, 1, 0), # => self.conv2
+            #                           nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            #                           nn.Conv2d(dim // 4, dim, 3, 1, 1)) # => self.conv3
+
+        self.qact1 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A,
+                          observer_str=cfg.OBSERVER_A,
+                          quantizer_str=cfg.QUANTIZER_A)
+        
+        self.qact2 = QAct(quant=quant,
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A,
+                          observer_str=cfg.OBSERVER_A,
+                          quantizer_str=cfg.QUANTIZER_A)
+        
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, 
+            patch_size=patch_size, 
+            in_chans=dim, 
+            embed_dim=dim,
+            norm_layer=norm_layer,
+            quant=quant,
+            calibrate=calibrate,
+            cfg=cfg)
+
+        self.patch_unembed = PatchUnEmbed(
+            img_size=img_size, 
+            patch_size=patch_size, 
+            in_chans=dim, 
+            embed_dim=dim,
+            norm_layer=None)
+
+    def forward(self, x, x_size, last_quantizer=None):
+
+        temp = self.residual_group(x, x_size, last_quantizer)
+        temp = self.qact1(temp)
+
+        temp = self.patch_unembed(temp, x_size)
+
+        temp = self.qact2(self.conv(temp))
+
+
+        return self.patch_embed(temp) + x
+
+    def flops(self):
+        flops = 0
+        flops += self.residual_group.flops()
+        H, W = self.input_resolution
+        flops += H * W * self.dim * self.dim * 9
+        flops += self.patch_embed.flops()
+        flops += self.patch_unembed.flops()
+
+        return flops
+
+class PatchUnEmbed(nn.Module):
+    r""" Image to Patch Unembedding
+
+    Args:
+        img_size (int): Image size.  Default: 224.
+        patch_size (int): Patch token size. Default: 4.
+        in_chans (int): Number of input image channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
+
+    def __init__(self, 
+                 img_size=224, 
+                 patch_size=4, 
+                 in_chans=3, 
+                 embed_dim=96, 
+                 norm_layer=None):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.patches_resolution = patches_resolution
+        self.num_patches = patches_resolution[0] * patches_resolution[1]
+
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+
+    def forward(self, x, x_size):
+        B, HW, C = x.shape
+        x = x.transpose(1, 2).view(B, self.embed_dim, x_size[0], x_size[1])  # B Ph*Pw C
+        return x
+
+    def flops(self):
+        flops = 0
+        return flops
+
+
+class Upsample(nn.Sequential):
+    """Upsample module.
+
+    Args:
+        scale (int): Scale factor. Supported scales: 2^n and 3.
+        num_feat (int): Channel number of intermediate features.
+    """
+
+    def __init__(self, scale, num_feat):
+        m = []
+        if (scale & (scale - 1)) == 0:  # scale = 2^n
+            for _ in range(int(math.log(scale, 2))):
+                m.append(nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1))
+                m.append(nn.PixelShuffle(2))
+        elif scale == 3:
+            m.append(nn.Conv2d(num_feat, 9 * num_feat, 3, 1, 1))
+            m.append(nn.PixelShuffle(3))
+        else:
+            raise ValueError(f'scale {scale} is not supported. ' 'Supported scales: 2^n and 3.')
+        super(Upsample, self).__init__(*m)
+        
+class Upsample_hf(nn.Sequential):
+    """Upsample module.
+
+    Args:
+        scale (int): Scale factor. Supported scales: 2^n and 3.
+        num_feat (int): Channel number of intermediate features.
+    """
+
+    def __init__(self, scale, num_feat):
+        m = []
+        if (scale & (scale - 1)) == 0:  # scale = 2^n
+            for _ in range(int(math.log(scale, 2))):
+                m.append(nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1))
+                m.append(nn.PixelShuffle(2))
+        elif scale == 3:
+            m.append(nn.Conv2d(num_feat, 9 * num_feat, 3, 1, 1))
+            m.append(nn.PixelShuffle(3))
+        else:
+            raise ValueError(f'scale {scale} is not supported. ' 'Supported scales: 2^n and 3.')
+        super(Upsample_hf, self).__init__(*m)        
+
+
+class UpsampleOneStep(nn.Sequential):
+    """UpsampleOneStep module (the difference with Upsample is that it always only has 1conv + 1pixelshuffle)
+       Used in lightweight SR to save parameters.
+
+    Args:
+        scale (int): Scale factor. Supported scales: 2^n and 3.
+        num_feat (int): Channel number of intermediate features.
+
+    """
+
+    def __init__(self, scale, num_feat, num_out_ch, input_resolution=None):
+        self.num_feat = num_feat
+        self.input_resolution = input_resolution
+        m = []
+        m.append(nn.Conv2d(num_feat, (scale ** 2) * num_out_ch, 3, 1, 1))
+        m.append(nn.PixelShuffle(scale))
+        super(UpsampleOneStep, self).__init__(*m)
+
+    def flops(self):
+        H, W = self.input_resolution
+        flops = H * W * self.num_feat * 3 * 9
+        return flops
+    
+    
+
+class Swin2SR(nn.Module):
+    r""" Swin2SR
+        A PyTorch impl of : `Swin2SR: SwinV2 Transformer for Compressed Image Super-Resolution and Restoration`.
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 64
+        patch_size (int | tuple(int)): Patch size. Default: 1
+        in_chans (int): Number of input image channels. Default: 3
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+        upscale: Upscale factor. 2/3/4/8 for image SR, 1 for denoising and compress artifact reduction
+        img_range: Image range. 1. or 255.
+        upsampler: The reconstruction reconstruction module. 'pixelshuffle'/'pixelshuffledirect'/'nearest+conv'/None
+        resi_connection: The convolutional block before residual connection. '1conv'/'3conv'
+    """
+
+    def __init__(self, 
+                 img_size=64, 
+                 patch_size=1, 
+                 in_chans=3,
+                 embed_dim=96, 
+                 depths=[6, 6, 6, 6], 
+                 num_heads=[6, 6, 6, 6],
+                 window_size=7, 
+                 mlp_ratio=4., 
+                 qkv_bias=True, 
+                 drop_rate=0., 
+                 attn_drop_rate=0., 
+                 drop_path_rate=0.1,
+                 norm_layer=nn.LayerNorm, 
+                 ape=False, 
+                 patch_norm=True,
+                 use_checkpoint=False, 
+                 upscale=2, 
+                 img_range=1., 
+                 upsampler='', 
+                 resi_connection='1conv',
+                 quant=False,
+                 calibrate=False,
+                 input_quant=False,
+                 cfg=None,
+                 **kwargs):
+        super(Swin2SR, self).__init__()
+        num_in_ch = in_chans
+        num_out_ch = in_chans
+        num_feat = 64
+        self.img_range = img_range
+        if in_chans == 3:
+            rgb_mean = (0.4488, 0.4371, 0.4040)
+            self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
+        else:
+            self.mean = torch.zeros(1, 1, 1, 1)
+        self.upscale = upscale
+        self.upsampler = upsampler
+        self.window_size = window_size
+        self.input_quant = input_quant # => for FQ-ViT
+        self.cfg = cfg # => for FQ-ViT
+        if input_quant: # => for FQ-ViT
+            self.qact_input = QAct(quant=quant,
+                                   calibrate=calibrate,
+                                   bit_type=cfg.BIT_TYPE_A,
+                                   calibration_mode=cfg.CALIBRATION_MODE_A,
+                                   observer_str=cfg.OBSERVER_A,
+                                   quantizer_str=cfg.QUANTIZER_A)
+       
+
+        #####################################################################################################
+        ################################### 1, shallow feature extraction ###################################
+        # self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
+        self.conv_first = QConv2d(num_in_ch, # => for FQ-ViT
+                            embed_dim, 
+                            kernel_size=3,
+                            stride=1,
+                            padding=1,
+                            quant=quant,
+                            calibrate=calibrate,
+                            bit_type=cfg.BIT_TYPE_W,
+                            calibration_mode=cfg.CALIBRATION_MODE_W,
+                            observer_str=cfg.OBSERVER_W,
+                            quantizer_str=cfg.QUANTIZER_W)
+        
+        #####################################################################################################
+        ################################### 2, deep feature extraction ######################################
+        self.num_layers = len(depths)
+        self.embed_dim = embed_dim
+        self.ape = ape
+        self.patch_norm = patch_norm
+        self.num_features = embed_dim
+        self.mlp_ratio = mlp_ratio
+
+        # split image into non-overlapping patches
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, 
+            patch_size=patch_size, 
+            in_chans=embed_dim, 
+            embed_dim=embed_dim,
+            norm_layer=norm_layer if self.patch_norm else None,
+            quant=quant,
+            calibrate=calibrate,
+            cfg=cfg)
+        
+
+        num_patches = self.patch_embed.num_patches
+        patches_resolution = self.patch_embed.patches_resolution
+        self.patches_resolution = patches_resolution
+
+        # merge non-overlapping patches into image
+        self.patch_unembed = PatchUnEmbed(
+            img_size=img_size, 
+            patch_size=patch_size, 
+            in_chans=embed_dim, 
+            embed_dim=embed_dim,
+            norm_layer=norm_layer if self.patch_norm else None)
+
+        # absolute position embedding
+        if self.ape:
+            self.absolute_pos_embed = nn.Parameter(
+                torch.zeros(1, num_patches, embed_dim))
+            trunc_normal_(self.absolute_pos_embed, std=.02)
+            self.qact1 = QAct(quant=quant, # => For FQ-ViT
+                                calibrate=calibrate,
+                                bit_type=cfg.BIT_TYPE_A,
+                                calibration_mode=cfg.CALIBRATION_MODE_LN,
+                                observer_str=cfg.OBSERVER_LN,
+                                quantizer_str=cfg.QUANTIZER_LN)
+     
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        # stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+
+        # build Residual Swin Transformer blocks (RSTB)
+        self.layers = nn.ModuleList()
+        for i_layer in range(self.num_layers):
+            layer = RSTB(dim=embed_dim,
+                         input_resolution=(patches_resolution[0],
+                                           patches_resolution[1]),
+                         depth=depths[i_layer],
+                         num_heads=num_heads[i_layer],
+                         window_size=window_size,
+                         mlp_ratio=self.mlp_ratio,
+                         qkv_bias=qkv_bias, 
+                         drop=drop_rate, attn_drop=attn_drop_rate,
+                         drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],  # no impact on SR results
+                         norm_layer=norm_layer,
+                         downsample=None,
+                         use_checkpoint=use_checkpoint,
+                         img_size=img_size,
+                         patch_size=patch_size,
+                         resi_connection=resi_connection,
+                         quant=quant, # => for FQ-ViT
+                         calibrate=calibrate, # => for FQ-ViT
+                         cfg=cfg
+                         )
+            self.layers.append(layer)
+            
+        if self.upsampler == 'pixelshuffle_hf':
+            self.layers_hf = nn.ModuleList()
+            for i_layer in range(self.num_layers):
+                layer = RSTB(dim=embed_dim,
+                             input_resolution=(patches_resolution[0],
+                                               patches_resolution[1]),
+                             depth=depths[i_layer],
+                             num_heads=num_heads[i_layer],
+                             window_size=window_size,
+                             mlp_ratio=self.mlp_ratio,
+                             qkv_bias=qkv_bias, 
+                             drop=drop_rate, attn_drop=attn_drop_rate,
+                             drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],  # no impact on SR results
+                             norm_layer=norm_layer,
+                             downsample=None,
+                             use_checkpoint=use_checkpoint,
+                             img_size=img_size,
+                             patch_size=patch_size,
+                             resi_connection=resi_connection,
+                             quant=quant, # => for FQ-ViT
+                             calibrate=calibrate, # => for FQ-ViT
+                             cfg=cfg
+                             )
+                self.layers_hf.append(layer)
+                        
+        self.norm = norm_layer(self.num_features)
+
+        self.qact2 = QAct(quant=quant, # for FQ-VIT
+                          calibrate=calibrate,
+                          bit_type=cfg.BIT_TYPE_A,
+                          calibration_mode=cfg.CALIBRATION_MODE_A,
+                          observer_str=cfg.OBSERVER_A,
+                          quantizer_str=cfg.QUANTIZER_A)
+     
+
+        # build the last conv layer in deep feature extraction
+        if resi_connection == '1conv':
+            self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
+        elif resi_connection == '3conv':
+            # to save parameters and memory
+            self.conv_after_body = nn.Sequential(nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1),
+                                                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                                 nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0),
+                                                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                                 nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1))
+
+        #####################################################################################################
+        ################################ 3, high quality image reconstruction ################################
+        if self.upsampler == 'pixelshuffle':
+            # for classical SR
+            self.conv_before_upsample = nn.Sequential(nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
+                                                      nn.LeakyReLU(inplace=True))
+            self.upsample = Upsample(upscale, num_feat)
+            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+        elif self.upsampler == 'pixelshuffle_aux':
+            self.conv_bicubic = nn.Conv2d(num_in_ch, num_feat, 3, 1, 1)
+            self.conv_before_upsample = nn.Sequential(
+                nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
+                nn.LeakyReLU(inplace=True))
+            self.conv_aux = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            self.conv_after_aux = nn.Sequential(
+                nn.Conv2d(3, num_feat, 3, 1, 1),
+                nn.LeakyReLU(inplace=True))            
+            self.upsample = Upsample(upscale, num_feat)
+            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            
+        elif self.upsampler == 'pixelshuffle_hf':
+            self.conv_before_upsample = nn.Sequential(nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
+                                                      nn.LeakyReLU(inplace=True))
+            self.upsample = Upsample(upscale, num_feat)
+            self.upsample_hf = Upsample_hf(upscale, num_feat)
+            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            self.conv_first_hf = nn.Sequential(nn.Conv2d(num_feat, embed_dim, 3, 1, 1),
+                                                      nn.LeakyReLU(inplace=True))
+            self.conv_after_body_hf = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
+            self.conv_before_upsample_hf = nn.Sequential(
+                nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
+                nn.LeakyReLU(inplace=True))
+            self.conv_last_hf = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            
+        elif self.upsampler == 'pixelshuffledirect':
+            # for lightweight SR (to save parameters)
+            self.upsample = UpsampleOneStep(upscale, embed_dim, num_out_ch,
+                                            (patches_resolution[0], patches_resolution[1]))
+        elif self.upsampler == 'nearest+conv':
+            # for real-world SR (less artifacts)
+            assert self.upscale == 4, 'only support x4 now.'
+            self.conv_before_upsample = nn.Sequential(nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
+                                                      nn.LeakyReLU(inplace=True))
+            self.conv_up1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
+            self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
+            self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
+            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        else:
+            # for image denoising and JPEG compression artifact reduction
+            self.conv_last = nn.Conv2d(embed_dim, num_out_ch, 3, 1, 1)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'absolute_pos_embed'}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {'relative_position_bias_table'}
+    
+    # Add the following methods for FQ-ViT
+    def model_quant(self):
+        print(f"I am in model_quant")
+        for m in self.modules():
+            # print(f"m = {m}")
+            if type(m) in [QConv2d, QLinear, QAct, QIntSoftmax]:
+                m.quant = True
+            
+            if self.cfg.INT_NORM:
+                if type(m) in [QIntLayerNorm]:
+                    m.mode = 'int'
+
+    def model_dequant(self):
+        for m in self.modules():
+            if type(m) in [QConv2d, QLinear, QAct, QIntSoftmax]:
+                m.quant = False
+
+    def model_open_calibrate(self):
+        for m in self.modules():
+            if type(m) in [QConv2d, QLinear, QAct, QIntSoftmax]:
+                m.calibrate = True
+
+    def model_open_last_calibrate(self):
+        for m in self.modules():
+            if type(m) in [QConv2d, QLinear, QAct, QIntSoftmax]:
+                m.last_calibrate = True
+
+    def model_close_calibrate(self):
+        for m in self.modules():
+            if type(m) in [QConv2d, QLinear, QAct, QIntSoftmax]:
+                m.calibrate = False
+
+    # End 
+
+    def check_image_size(self, x):
+        _, _, h, w = x.size()
+        mod_pad_h = (self.window_size - h % self.window_size) % self.window_size
+        mod_pad_w = (self.window_size - w % self.window_size) % self.window_size
+        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
+        return x
+
+    def forward_features(self, x):
+        last_quantizer = None
+
+        x_size = (x.shape[2], x.shape[3])
+
+        if self.input_quant: # for quant
+            x = self.qact_input(x)
+
+        x = self.patch_embed(x)
+        if self.ape:
+            x = x + self.absolute_pos_embed
+            x = self.qact1(x)
+
+        x = self.pos_drop(x)
+
+        # for layer in self.layers:
+        #     x = layer(x, x_size)
+        for i, layer in enumerate(self.layers):
+            if i == 0:
+                last_quantizer = self.patch_embed.qact.quantizer
+            else:
+                if self.layers[i - 1].residual_group.downsample:
+                    last_quantizer = self.layers[i - 1].residual_group.downsample.qact2.quantizer
+
+            
+            x = layer(x, x_size, last_quantizer)
+
+
+        # x = self.norm(x)  # B L C
+        x = self.norm(x, self.layers[-1].residual_group.blocks[-1].qact4.quantizer,
+                      self.qact2.quantizer)  # B L C # quant
+        x = self.qact2(x) # quant
+
+        x = self.patch_unembed(x, x_size)
+
+        return x
+    
+    def forward_features_hf(self, x):
+        x_size = (x.shape[2], x.shape[3])
+
+        if self.input_quant: # for quant
+            x = self.qact_input(x)
+
+        x = self.patch_embed(x)
+        if self.ape:
+            x = x + self.absolute_pos_embed
+            x = self.qact1(x)
+
+        x = self.pos_drop(x)
+
+        # for layer in self.layers_hf:
+        #     x = layer(x, x_size)
+        for i, layer in enumerate(self.layers_hf):
+            if i == 0:
+                last_quantizer = self.patch_embed.qact.quantizer
+            else:
+                if self.layers_hf[i - 1].residual_group.downsample:
+                    last_quantizer = self.layers_hf[i - 1].residual_group.downsample.qact2.quantizer
+
+            
+            x = layer(x, x_size, last_quantizer)
+
+
+        # x = self.norm(x)  # B L C
+        x = self.norm(x, self.layers_hf[-1].blocks[-1].qact4.quantizer,
+                self.qact2.quantizer)  # B L C # quant
+        x = self.qact2(x) # quant
+        x = self.patch_unembed(x, x_size)
+
+        return x    
+
+    def forward(self, x):
+        H, W = x.shape[2:]
+        x = self.check_image_size(x)
+
+        self.mean = self.mean.type_as(x)
+        x = (x - self.mean) * self.img_range
+
+        if self.upsampler == 'pixelshuffle':
+            # for classical SR
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.conv_before_upsample(x)
+            x = self.conv_last(self.upsample(x))
+        elif self.upsampler == 'pixelshuffle_aux':
+            bicubic = F.interpolate(x, size=(H * self.upscale, W * self.upscale), mode='bicubic', align_corners=False)
+            bicubic = self.conv_bicubic(bicubic)
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.conv_before_upsample(x)
+            aux = self.conv_aux(x) # b, 3, LR_H, LR_W
+            x = self.conv_after_aux(aux)
+            x = self.upsample(x)[:, :, :H * self.upscale, :W * self.upscale] + bicubic[:, :, :H * self.upscale, :W * self.upscale]
+            x = self.conv_last(x)
+            aux = aux / self.img_range + self.mean
+        elif self.upsampler == 'pixelshuffle_hf':
+            # for classical SR with HF
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            x_before = self.conv_before_upsample(x)
+            x_out = self.conv_last(self.upsample(x_before))
+            
+            x_hf = self.conv_first_hf(x_before)
+            x_hf = self.conv_after_body_hf(self.forward_features_hf(x_hf)) + x_hf
+            x_hf = self.conv_before_upsample_hf(x_hf)
+            x_hf = self.conv_last_hf(self.upsample_hf(x_hf))
+            x = x_out + x_hf
+            x_hf = x_hf / self.img_range + self.mean
+
+        elif self.upsampler == 'pixelshuffledirect':
+            # for lightweight SR
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.upsample(x)
+        elif self.upsampler == 'nearest+conv':
+            # for real-world SR
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.conv_before_upsample(x)
+            x = self.lrelu(self.conv_up1(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
+            x = self.lrelu(self.conv_up2(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
+            x = self.conv_last(self.lrelu(self.conv_hr(x)))
+        else:
+            # for image denoising and JPEG compression artifact reduction
+            x_first = self.conv_first(x)
+            res = self.conv_after_body(self.forward_features(x_first)) + x_first
+            x = x + self.conv_last(res)
+        
+        x = x / self.img_range + self.mean
+        if self.upsampler == "pixelshuffle_aux":
+            return x[:, :, :H*self.upscale, :W*self.upscale], aux
+        
+        elif self.upsampler == "pixelshuffle_hf":
+            x_out = x_out / self.img_range + self.mean
+            return x_out[:, :, :H*self.upscale, :W*self.upscale], x[:, :, :H*self.upscale, :W*self.upscale], x_hf[:, :, :H*self.upscale, :W*self.upscale]
+        
+        else:
+            return x[:, :, :H*self.upscale, :W*self.upscale]
+
+    def flops(self):
+        flops = 0
+        H, W = self.patches_resolution
+        flops += H * W * 3 * self.embed_dim * 9
+        flops += self.patch_embed.flops()
+        for i, layer in enumerate(self.layers):
+            flops += layer.flops()
+        flops += H * W * 3 * self.embed_dim * self.embed_dim
+        flops += self.upsample.flops()
+        return flops
+
+
+if __name__ == '__main__':
+    upscale = 4
+    window_size = 8
+    height = (1024 // upscale // window_size + 1) * window_size
+    width = (720 // upscale // window_size + 1) * window_size
+    model = Swin2SR(upscale=2, img_size=(height, width),
+                   window_size=window_size, img_range=1., depths=[6, 6, 6, 6],
+                   embed_dim=60, num_heads=[6, 6, 6, 6], mlp_ratio=2, upsampler='pixelshuffledirect')
+    print(model)
+    print(height, width, model.flops() / 1e9)
+
+    x = torch.randn((1, 3, height, width))
+    x = model(x)
+    print(x.shape)
+
+
+
+
+
+
+
+import argparse
+import math
+import os
+import time
+
+import torch
+import torch.nn as nn
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+from PIL import Image
+from collections import OrderedDict
+import glob
+import numpy as np
+import cv2
+
+from config import Config
+from models import *
+
+parser = argparse.ArgumentParser(description='FQ-ViT')
+
+parser.add_argument('model',
+                    choices=[
+                        'deit_tiny', 'deit_small', 'deit_base', 'vit_base',
+                        'vit_large', 'swin_tiny', 'swin_small', 'swin_base',
+                        'swin_sr_classic_x2'
+                    ],
+                    help='model')
+parser.add_argument('data', metavar='DIR', help='path to dataset')
+parser.add_argument('--quant', default=False, action='store_true')
+parser.add_argument('--ptf', default=False, action='store_true')
+parser.add_argument('--lis', default=False, action='store_true')
+parser.add_argument('--quant-method',
+                    default='minmax',
+                    choices=['minmax', 'ema', 'omse', 'percentile'])
+parser.add_argument('--calib-batchsize',
+                    default=100,
+                    type=int,
+                    help='batchsize of calibration set')
+parser.add_argument('--calib-iter', default=10, type=int)
+parser.add_argument('--val-batchsize',
+                    default=100,
+                    type=int,
+                    help='batchsize of validation set')
+parser.add_argument('--num-workers',
+                    default=16,
+                    type=int,
+                    help='number of data loading workers (default: 16)')
+parser.add_argument('--device', default='cuda', type=str, help='device')
+parser.add_argument('--print-freq',
+                    default=100,
+                    type=int,
+                    help='print frequency')
+parser.add_argument('--seed', default=0, type=int, help='seed')
+
+
+def str2model(name):
+    d = {
+        'deit_tiny': deit_tiny_patch16_224,
+        'deit_small': deit_small_patch16_224,
+        'deit_base': deit_base_patch16_224,
+        'vit_base': vit_base_patch16_224,
+        'vit_large': vit_large_patch16_224,
+        'swin_tiny': swin_tiny_patch4_window7_224,
+        'swin_small': swin_small_patch4_window7_224,
+        'swin_base': swin_base_patch4_window7_224,
+        'swin_sr_classic_x2': swin_swin2sr_classic_x2
+    }
+    print('Model: %s' % d[name].__name__)
+    return d[name]
+
+
+def seed(seed=0):
+    import os
+    import random
+    import sys
+
+    import numpy as np
+    import torch
+    sys.setrecursionlimit(100000)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    np.random.seed(seed)
+    random.seed(seed)
+
+# The following is added by Cassie
+def setup(args):
+    border = 2 #args.scale
+    window_size = 8
+    save_dir = f'results/swin2sr_classical_2x'
+    folder = args["folder_lq"]
+
+    return folder, save_dir, border, window_size
+
+
+def get_image_pair(args, path):
+    (imgname, imgext) = os.path.splitext(os.path.basename(path))
+
+    # 001 classical image sr/ 002 lightweight image sr (load lq-gt image pairs)
+    if args["task"] in ['classical_sr', 'lightweight_sr']:
+        if args["save_img_only"]:
+            img_gt = None
+            img_lq = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.            
+        else:
+            img_gt = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.
+            img_lq = cv2.imread(f'{args["folder_lq"]}/{imgname}{imgext}', cv2.IMREAD_COLOR).astype(
+                np.float32) / 255.
+            # print(f'{args["folder_lq"]}/{imgname}x{args["scale"]}{imgext}') 
+            # print(f'{args["folder_lq"]}/{imgname}{imgext}')       
+            # img_lq = cv2.imread(f'{args["folder_lq"]}/{imgname}x{args["scale"]}{imgext}', cv2.IMREAD_COLOR).astype(
+            #     np.float32) / 255.            
+        
+    # elif args["task"] in ['compressed_sr']:
+    #     if args.save_img_only:
+    #         img_gt = None
+    #         img_lq = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.            
+    #     else:
+    #         img_gt = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.
+    #         img_lq = cv2.imread(f'{args.folder_lq}/{imgname}.jpg', cv2.IMREAD_COLOR).astype(
+    #             np.float32) / 255.        
+
+    # # 003 real-world image sr (load lq image only)
+    # elif args["task"] in ['real_sr', 'lightweight_sr_infer']:
+    #     img_gt = None
+    #     img_lq = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.
+
+    # # 006 grayscale JPEG compression artifact reduction (load gt image and generate lq image on-the-fly)
+    # elif args["task"] in ['jpeg_car']:
+    #     img_gt = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    #     if img_gt.ndim != 2:
+    #         img_gt = util.bgr2ycbcr(img_gt, y_only=True)
+    #     result, encimg = cv2.imencode('.jpg', img_gt, [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg])
+    #     img_lq = cv2.imdecode(encimg, 0)
+    #     img_gt = np.expand_dims(img_gt, axis=2).astype(np.float32) / 255.
+    #     img_lq = np.expand_dims(img_lq, axis=2).astype(np.float32) / 255.
+
+    # # 006 JPEG compression artifact reduction (load gt image and generate lq image on-the-fly)
+    # elif args["task"] in ['color_jpeg_car']:
+    #     img_gt = cv2.imread(path)
+    #     result, encimg = cv2.imencode('.jpg', img_gt, [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg])
+    #     img_lq = cv2.imdecode(encimg, 1)
+    #     img_gt = img_gt.astype(np.float32)/ 255.
+    #     img_lq = img_lq.astype(np.float32)/ 255.
+
+    return imgname, img_lq, img_gt
+
+
+def test(img_lq, model, args, window_size):
+    if args["tile"] is None:
+        # test the image as a whole
+        output = model(img_lq)
+    else:
+        # test the image tile by tile
+        b, c, h, w = img_lq.size()
+        tile = min(args["tile"], h, w)
+        assert tile % window_size == 0, "tile size should be a multiple of window_size"
+        tile_overlap = args["tile_overlap"]
+        sf = args["scale"]
+
+        stride = tile - tile_overlap
+        h_idx_list = list(range(0, h-tile, stride)) + [h-tile]
+        w_idx_list = list(range(0, w-tile, stride)) + [w-tile]
+        E = torch.zeros(b, c, h*sf, w*sf).type_as(img_lq)
+        W = torch.zeros_like(E)
+
+        for h_idx in h_idx_list:
+            for w_idx in w_idx_list:
+                in_patch = img_lq[..., h_idx:h_idx+tile, w_idx:w_idx+tile]
+                out_patch = model(in_patch)
+                out_patch_mask = torch.ones_like(out_patch)
+
+                E[..., h_idx*sf:(h_idx+tile)*sf, w_idx*sf:(w_idx+tile)*sf].add_(out_patch)
+                W[..., h_idx*sf:(h_idx+tile)*sf, w_idx*sf:(w_idx+tile)*sf].add_(out_patch_mask)
+        output = E.div_(W)
+
+    return output
+
+
+def main():
+    args = parser.parse_args()
+    seed(args.seed)
+   
+    device = torch.device(args.device)
+    cfg = Config(args.ptf, args.lis, args.quant_method)
+    # print(cfg)
+    model = str2model(args.model)(pretrained=True, cfg=cfg)
+    model = model.to(device)
+
+    # Note: Different models have different strategies of data preprocessing.
+    model_type = args.model.split('_')[0]
+    if model_type == 'deit':
+        mean = (0.485, 0.456, 0.406)
+        std = (0.229, 0.224, 0.225)
+        crop_pct = 0.875
+    elif model_type == 'vit':
+        mean = (0.5, 0.5, 0.5)
+        std = (0.5, 0.5, 0.5)
+        crop_pct = 0.9
+    elif model_type == 'swin':
+        mean = (0.485, 0.456, 0.406)
+        std = (0.229, 0.224, 0.225)
+        crop_pct = 0.9
+    else:
+        raise NotImplementedError
+
+############## comment the following for now 
+    # train_transform = build_transform(mean=mean, std=std, crop_pct=crop_pct)
+    # val_transform = build_transform(mean=mean, std=std, crop_pct=crop_pct)
+
+    # # Data
+    # # traindir = os.path.join(args.data, 'train')
+    # # valdir = os.path.join(args.data, 'val')
+    # traindir = "C:\\Dropbox\\sr\\swin2sr\\testsets\\Set5\\LR_bicubic\\X2"
+    # valdir = "C:\\Dropbox\\sr\\swin2sr\\testsets\\Set5\\HR"
+
+    # val_dataset = datasets.ImageFolder(valdir, val_transform)
+    # val_loader = torch.utils.data.DataLoader(
+    #     val_dataset,
+    #     batch_size=args.val_batchsize,
+    #     shuffle=False,
+    #     num_workers=args.num_workers,
+    #     pin_memory=True,
+    # )
+####################################
+    
+
+    args_temp = {}
+    args_temp["folder_lq"] = "C:\\Dropbox\\sr\\swin2sr\\testsets\\Set5\\LR_bicubic\\X2"
+    args_temp["folder_gt"] = "C:\\Dropbox\\sr\\swin2sr\\testsets\\Set5\\HR"
+    args_temp["task"] = "classical_sr"
+    args_temp["scale"] = 2
+    args_temp["save_img_only"] = False
+    args_temp["tile"] = None
+
+    # setup folder and path
+    folder, save_dir, border, window_size = setup(args_temp)
+    os.makedirs(save_dir, exist_ok=True)
+    test_results = OrderedDict()
+    test_results['psnr'] = []
+    test_results['ssim'] = []
+    test_results['psnr_y'] = []
+    test_results['ssim_y'] = []
+    test_results['psnrb'] = []
+    test_results['psnrb_y'] = []
+    psnr, ssim, psnr_y, ssim_y, psnrb, psnrb_y = 0, 0, 0, 0, 0, 0
+    
+    latency = 0 
+    count = 0
+    image_list_len = len(sorted(glob.glob(os.path.join(folder, '*'))))
+    # switch to evaluate mode
+    model.eval()
+
+    if args.quant:
+        # Get calibration set.
+        image_list_lq = []
+        image_list_val = []
+        image_list_gt = []
+
+        for idx, path in enumerate(sorted(glob.glob(os.path.join(folder, '*')))):
+            if idx == args.calib_iter:
+                break
+            # read image
+            imgname, img_lq, img_gt = get_image_pair(args_temp, path)  # image to HWC-BGR, float32
+            img_lq = np.transpose(img_lq if img_lq.shape[2] == 1 else img_lq[:, :, [2, 1, 0]], (2, 0, 1))  # HCW-BGR to CHW-RGB
+            img_lq = torch.from_numpy(img_lq).float().unsqueeze(0).to(device)  # CHW-RGB to NCHW-RGB
+
+            # pad input image to be a multiple of window_size
+            _, _, h_old, w_old = img_lq.size()
+            h_pad = (h_old // window_size + 1) * window_size - h_old
+            w_pad = (w_old // window_size + 1) * window_size - w_old
+            img_lq = torch.cat([img_lq, torch.flip(img_lq, [2])], 2)[:, :, :h_old + h_pad, :]
+            img_lq = torch.cat([img_lq, torch.flip(img_lq, [3])], 3)[:, :, :, :w_old + w_pad]
+
+            image_list_lq.append(img_lq)
+            image_list_gt.append(img_gt)
+        
+        for idx, path in enumerate(sorted(glob.glob(os.path.join(folder, '*')))):
+            if idx == args.calib_iter:
+                break
+            # read image
+            imgname, img_lq, img_gt = get_image_pair(args_temp, path)  # image to HWC-BGR, float32
+            img_lq = np.transpose(img_lq if img_lq.shape[2] == 1 else img_lq[:, :, [2, 1, 0]], (2, 0, 1))  # HCW-BGR to CHW-RGB
+            img_lq = torch.from_numpy(img_lq).float().unsqueeze(0).to(device)  # CHW-RGB to NCHW-RGB
+
+            # pad input image to be a multiple of window_size
+            _, _, h_old, w_old = img_lq.size()
+            h_pad = (h_old // window_size + 1) * window_size - h_old
+            w_pad = (w_old // window_size + 1) * window_size - w_old
+            img_lq = torch.cat([img_lq, torch.flip(img_lq, [2])], 2)[:, :, :h_old + h_pad, :]
+            img_lq = torch.cat([img_lq, torch.flip(img_lq, [3])], 3)[:, :, :, :w_old + w_pad]
+
+            image_list_val.append(img_lq)
+
+        print('Calibrating...')
+        model.model_open_calibrate() # => from FQ-ViT
+
+        with torch.no_grad():
+            for i, image in enumerate(image_list_lq):
+                if i == len(image_list_lq) - 1:
+                    # This is used for OMSE method to
+                    # calculate minimum quantization error
+                    model.model_open_last_calibrate()
+
+                output = test(image, model, args_temp, window_size)
+
+                if args_temp["task"] == 'compressed_sr':
+                    output = output[0][..., :h_old * args_temp["scale"], :w_old * args_temp["scale"]]
+                else:
+                    output = output[..., :h_old * args_temp["scale"], :w_old * args_temp["scale"]]
+
+                # # save image
+                # output = output.data.squeeze().float().cpu().clamp_(0, 1).numpy()
+                # if output.ndim == 3:
+                #     output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))  # CHW-RGB to HCW-BGR
+                # output = (output * 255.0).round().astype(np.uint8)  # float32 to uint8
+                # cv2.imwrite(f'{save_dir}/{imgname}_Swin2SR_Quant.png', output)
+
+        model.model_close_calibrate()
+        model.model_quant()
+
+        # Validation
+        for i, image in enumerate(image_list_val):
+            with torch.no_grad():
+                output = test(image, model, args_temp, window_size)
+
+            if args_temp["task"] == 'compressed_sr':
+                output = output[0][..., :h_old * args_temp["scale"], :w_old * args_temp["scale"]]
+            else:
+                output = output[..., :h_old * args_temp["scale"], :w_old * args_temp["scale"]]
+
+            # save image
+            output = output.data.squeeze().float().cpu().clamp_(0, 1).numpy()
+            if output.ndim == 3:
+                output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))  # CHW-RGB to HCW-BGR
+            output = (output * 255.0).round().astype(np.uint8)  # float32 to uint8
+            cv2.imwrite(f'{save_dir}/{imgname}_Swin2SR_Quant.png', output)
+
+
+        # torch.save(model.state_dict(), "model_state_dict_test1.pth")
+
+        # Print model's state_dict
+        print("Model's state_dict:")
+        # for param_tensor in model.state_dict():
+        #     print(param_tensor, "\t", model.state_dict()[param_tensor].size())
+
+        for param in model.parameters():
+            if param.dtype != torch.float32:
+                print(param.dtype)
+
+
+def validate(args, val_loader, model, criterion, device):
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
+
+    val_start_time = end = time.time()
+    for i, (data, target) in enumerate(val_loader):
+        data = data.to(device)
+        target = target.to(device)
+
+        with torch.no_grad():
+            output = model(data)
+        loss = criterion(output, target)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+        losses.update(loss.data.item(), data.size(0))
+        top1.update(prec1.data.item(), data.size(0))
+        top5.update(prec5.data.item(), data.size(0))
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            print('Test: [{0}/{1}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                      i,
+                      len(val_loader),
+                      batch_time=batch_time,
+                      loss=losses,
+                      top1=top1,
+                      top5=top5,
+                  ))
+    val_end_time = time.time()
+    print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Time {time:.3f}'.
+          format(top1=top1, top5=top5, time=val_end_time - val_start_time))
+
+    return losses.avg, top1.avg, top5.avg
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def accuracy(output, target, topk=(1, )):
+    """Computes the precision@k for the specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
+
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.reshape(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].reshape(-1).float().sum(0)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+
+def build_transform(input_size=224,
+                    interpolation='bicubic',
+                    mean=(0.485, 0.456, 0.406),
+                    std=(0.229, 0.224, 0.225),
+                    crop_pct=0.875):
+
+    def _pil_interp(method):
+        if method == 'bicubic':
+            return Image.BICUBIC
+        elif method == 'lanczos':
+            return Image.LANCZOS
+        elif method == 'hamming':
+            return Image.HAMMING
+        else:
+            return Image.BILINEAR
+
+    resize_im = input_size > 32
+    t = []
+    if resize_im:
+        size = int(math.floor(input_size / crop_pct))
+        ip = _pil_interp(interpolation)
+        t.append(
+            transforms.Resize(
+                size,
+                interpolation=ip),  # to maintain same ratio w.r.t. 224 images
+        )
+        t.append(transforms.CenterCrop(input_size))
+
+    t.append(transforms.ToTensor())
+    t.append(transforms.Normalize(mean, std))
+    return transforms.Compose(t)
+
+def main2():
+    args = parser.parse_args()
+    seed(args.seed)
+
+    device = torch.device(args.device)
+    cfg = Config(args.ptf, args.lis, args.quant_method)
+    model = str2model(args.model)(pretrained=True,
+                                #   quant=args.quant,
+                                #   calibrate=True,
+                                  cfg=cfg)
+    model = model.to(device)
+    print(f"args.ptf={args.ptf},\n args.lis={args.lis},\n args.quant_method={args.quant_method},\nargs.quant={args.quant}\n")
+
+    # Note: Different models have different strategies of data preprocessing.
+    model_type = args.model.split('_')[0]
+    if model_type == 'deit':
+        mean = (0.485, 0.456, 0.406)
+        std = (0.229, 0.224, 0.225)
+        crop_pct = 0.875
+    elif model_type == 'vit':
+        mean = (0.5, 0.5, 0.5)
+        std = (0.5, 0.5, 0.5)
+        crop_pct = 0.9
+    elif model_type == 'swin':
+        mean = (0.485, 0.456, 0.406)
+        std = (0.229, 0.224, 0.225)
+        crop_pct = 0.9
+    else:
+        raise NotImplementedError
+
+    train_transform = build_transform(mean=mean, std=std, crop_pct=crop_pct)
+    val_transform = build_transform(mean=mean, std=std, crop_pct=crop_pct)
+
+    # Data
+    traindir = os.path.join(args.data, 'train')
+    valdir = os.path.join(args.data, 'val')
+
+    val_dataset = datasets.ImageFolder(valdir, val_transform)
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=args.val_batchsize,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    # switch to evaluate mode
+    torch.save(model.state_dict(), "model_state_dict_vit_base.pth")
+    model.eval()
+    
+
+    # define loss function (criterion)
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    if args.quant:
+        train_dataset = datasets.ImageFolder(traindir, train_transform)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.calib_batchsize,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+        # Get calibration set.
+        image_list = []
+        for i, (data, target) in enumerate(train_loader):
+            if i == args.calib_iter:
+                break
+            data = data.to(device)
+            image_list.append(data)
+
+        print('Calibrating...')
+        model.model_open_calibrate()
+        print('Calibrating...1')
+        with torch.no_grad():
+            for i, image in enumerate(image_list):
+                if i == len(image_list) - 1:
+                    # This is used for OMSE method to
+                    # calculate minimum quantization error
+                    model.model_open_last_calibrate()
+                print('Calibrating...2')
+                output = model(image)
+        print('Calibrating...3')
+        model.model_close_calibrate()
+        model.model_quant()
+
+    # for m in model.modules():
+    #     if type(m) in [QConv2d, QLinear, QAct, QIntSoftmax]:
+    #         print(f"{m}, m.quant = { m.quant}")
+    #     # if m.cfg.INT_NORM:
+    #     #     if type(m) in [QIntLayerNorm]:
+    #     #         print(f"{m}, m.mode = { m.mode}")
+
+   
+    # print(list(model.named_parameters()))
+        # if param.dtype != torch.float32:
+        #     print(param.dtype)
+
+    # print('Validating...')
+    val_loss, val_prec1, val_prec5 = validate(args, val_loader, model,
+                                              criterion, device)
+    
+    print(f"param dtype in model.parameters")
+    for param in model.parameters():
+        print(f"vit_base: {param.dtype}")
+    print(model)
+    
+    # torch.save(model.state_dict(), "model_state_dict_vit_base_quant.pth")
+    # torch.save(model, "model_state_dict_vit_base_quant_entire.pth")
+    
+# def memory_stats():
+#     print(torch.cuda.memory_allocated()/1024**2)
+#     print(torch.cuda.memory_cached()/1024**2)
+
+# def allocate():
+#     x = torch.randn(1024*1024, device='cuda')
+#     memory_stats()
+
+if __name__ == '__main__':
+    # torch.cuda.empty_cache()
+    # main()
+    main2()
+
+
+
+
+
+
+
+
+
+
+
+
+
